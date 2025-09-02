@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GDTML 1.0</title>
+<style>
+  html, body { margin:0; padding:0; background:#111; height:100%; overflow:hidden; }
+  canvas { display:block; background:#222; outline:none; }
+  #toolbar {
+    position:absolute; top:10px; left:10px; z-index:10; color:white; font-family:sans-serif;
+    background:rgba(0,0,0,0.35); padding:8px 10px; border-radius:8px; backdrop-filter: blur(4px);
+  }
+  button, input { margin:3px; cursor:pointer; }
+  input[type="color"] { width:140px; height:28px; border:none; padding:0; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button id="toggleModeBtn">Switch to Play Mode</button>
+  <button id="toolPlatformBtn">Platform</button>
+  <button id="toolSpikeBtn">Spike</button>
+  <button id="toolJumpPadBtn">Jump Pad</button>
+  <button id="toolSpeed1Btn">Speed 1x</button>
+  <button id="toolSpeed2Btn">Speed 1.3x</button>
+  <button id="toolWavePortalBtn">Wave Portal</button>
+  <button id="toolCubePortalBtn">Cube Portal</button>
+  <button id="toolColorBtn">Cube Color Trigger</button>
+  <button id="toolBGBtn">BG Color Trigger</button>
+  <button id="startBlockBtn">Start Block</button>
+  <button id="endBlockBtn">End Block</button>
+  <button id="deleteModeBtn">Delete Mode: OFF</button>
+  <br>
+  <input type="color" id="colorPicker" value="#00ffff">
+</div>
+<canvas id="game" tabindex="0"></canvas>
+<audio id="bgSong" loop src="music/song.mp3"></audio>
+
+<script>
+/* Canvas and sizing */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let gridSize = 50, groundY = 0;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  groundY = canvas.height - gridSize;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* Input */
+let keys = {};
+let mouseDown = false;
+document.addEventListener("keydown", e => { keys[e.code] = true; });
+document.addEventListener("keyup",   e => { keys[e.code] = false; });
+canvas.addEventListener("mousedown", e => { mouseDown = true; });
+canvas.addEventListener("mouseup",   e => { mouseDown = false; });
+
+/* Camera */
+let cameraX = 0;
+let lastMouseX = null;
+
+/* Player */
+const player = {
+  x: 0, y: 0, w: 50, h: 50,
+  dy: 0, gravity: 0.8,
+  dashSpeed: 6.5, grounded: false,
+  color: "cyan",
+  wave: false, waveDir: -1, waveSpeed: 7
+};
+
+/* World objects */
+let platforms = [], spikes = [], jumpPads = [], speedPortals = [],
+    wavePortals = [], cubePortals = [], colorTriggers = [], bgTriggers = [];
+
+let startBlock = { x: 100, y: groundY - gridSize, size: gridSize };
+let endBlock   = { x: 800, y: groundY - gridSize, size: gridSize };
+
+/* State */
+let frame = 0, editMode = true, deleteMode = false, currentTool = "platform";
+let bgColor = "#222";
+
+/* UI elements */
+const toggleModeBtn = document.getElementById("toggleModeBtn");
+const deleteModeBtn = document.getElementById("deleteModeBtn");
+const colorPicker   = document.getElementById("colorPicker");
+const bgSong        = document.getElementById("bgSong");
+
+/* Toolbar actions */
+toggleModeBtn.addEventListener("click", () => {
+  editMode = !editMode;
+  toggleModeBtn.textContent = editMode ? "Switch to Play Mode" : "Switch to Editor Mode";
+  restart();
+  canvas.focus();
+  if (editMode) bgSong.pause();
+  else tryPlaySong();
+});
+
+document.getElementById("toolPlatformBtn").addEventListener("click", ()=>{ setTool("platform"); });
+document.getElementById("toolSpikeBtn").addEventListener("click",    ()=>{ setTool("spike"); });
+document.getElementById("toolJumpPadBtn").addEventListener("click",  ()=>{ setTool("jumpPad"); });
+document.getElementById("toolSpeed1Btn").addEventListener("click",   ()=>{ setTool("speed1"); });
+document.getElementById("toolSpeed2Btn").addEventListener("click",   ()=>{ setTool("speed2"); });
+document.getElementById("toolWavePortalBtn").addEventListener("click",()=>{ setTool("wavePortal"); });
+document.getElementById("toolCubePortalBtn").addEventListener("click",()=>{ setTool("cubePortal"); });
+document.getElementById("toolColorBtn").addEventListener("click",    ()=>{ setTool("color"); });
+document.getElementById("toolBGBtn").addEventListener("click",       ()=>{ setTool("bg"); });
+document.getElementById("startBlockBtn").addEventListener("click",   ()=>{ setTool("start"); });
+document.getElementById("endBlockBtn").addEventListener("click",     ()=>{ setTool("end"); });
+
+function setTool(t) { currentTool = t; deleteMode = false; updateDeleteBtn(); }
+
+deleteModeBtn.addEventListener("click", () => { deleteMode = !deleteMode; updateDeleteBtn(); });
+function updateDeleteBtn() { deleteModeBtn.textContent = "Delete Mode: " + (deleteMode ? "ON" : "OFF"); }
+
+/* Canvas interactions */
+canvas.addEventListener("mousedown", (e) => {
+  if (editMode) { placeObject(e.clientX, e.clientY); }
+  else { jumpOrWave(); }
+  lastMouseX = e.clientX;
+  canvas.focus();
+});
+canvas.addEventListener("mousemove", (e) => {
+  if (editMode && e.buttons === 1 && lastMouseX !== null) {
+    cameraX -= (e.clientX - lastMouseX);
+  }
+  lastMouseX = e.clientX;
+});
+
+/* Keyboard shortcuts */
+document.addEventListener("keydown", (e) => {
+  const tag = (e.target && e.target.tagName) || '';
+  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable);
+  if (typing) return;
+
+  if (!editMode && e.code === "Space") {
+    e.preventDefault();
+    jumpOrWave();
+  }
+  if (e.code === "KeyE") {
+    editMode = !editMode;
+    toggleModeBtn.textContent = editMode ? "Switch to Play Mode" : "Switch to Editor Mode";
+    restart();
+    canvas.focus();
+    if (editMode) bgSong.pause();
+    else tryPlaySong();
+  }
+});
+
+/* Placement and deletion */
+function placeObject(x, y) {
+  const gridX = Math.floor((x + cameraX) / gridSize) * gridSize;
+  const gridY = Math.floor(y / gridSize) * gridSize;
+  if (gridY >= groundY) return;
+
+  if (deleteMode) {
+    platforms   = platforms.filter(p => !(p.x === gridX && p.y === gridY));
+    spikes      = spikes.filter(s => !(s.x === gridX && s.y === gridY));
+    jumpPads    = jumpPads.filter(j => !(j.x === gridX && j.y === gridY));
+    speedPortals= speedPortals.filter(s => !(s.x === gridX && s.y === gridY));
+    wavePortals = wavePortals.filter(w => !(w.x === gridX && w.y === gridY));
+    cubePortals = cubePortals.filter(c => !(c.x === gridX && c.y === gridY));
+    colorTriggers = colorTriggers.filter(c => !(c.x === gridX && c.y === gridY));
+    bgTriggers    = bgTriggers.filter(c => !(c.x === gridX && c.y === gridY));
+
+    if (gridX === startBlock.x && gridY === startBlock.y)
+      startBlock = { x: 100, y: groundY - gridSize, size: gridSize };
+    if (gridX === endBlock.x && gridY === endBlock.y)
+      endBlock = { x: 800, y: groundY - gridSize, size: gridSize };
+  } else {
+    if (currentTool === "platform") platforms.push({ x: gridX, y: gridY, size: gridSize });
+    else if (currentTool === "spike") spikes.push({ x: gridX, y: gridY, size: gridSize });
+    else if (currentTool === "jumpPad") jumpPads.push({ x: gridX, y: gridY, size: gridSize });
+    else if (currentTool === "speed1") speedPortals.push({ x: gridX, y: gridY, size: gridSize, speed: 1.0 });
+    else if (currentTool === "speed2") speedPortals.push({ x: gridX, y: gridY, size: gridSize, speed: 1.3 });
+    else if (currentTool === "wavePortal") wavePortals.push({ x: gridX, y: gridY, size: gridSize });
+    else if (currentTool === "cubePortal") cubePortals.push({ x: gridX, y: gridY, size: gridSize });
+    else if (currentTool === "color") colorTriggers.push({ x: gridX, y: gridY, size: gridSize, color: colorPicker.value });
+    else if (currentTool === "bg") bgTriggers.push({ x: gridX, y: gridY, size: gridSize, color: colorPicker.value });
+    else if (currentTool === "start") startBlock = { x: gridX, y: gridY, size: gridSize };
+    else if (currentTool === "end") endBlock = { x: gridX, y: gridY, size: gridSize };
+  }
+}
+
+/* Player actions */
+function jumpOrWave() {
+  if (!player.wave && player.grounded) {
+    player.dy = -15;
+    player.grounded = false;
+  } else if (player.wave) {
+    // Tap-to-flip direction option (kept simple); main control is hold-to-go-up
+    player.waveDir = -1; // ensure upward burst on tap
+  }
+}
+
+function tryPlaySong() {
+  // Play only in play mode; ignore errors (user gesture policy)
+  if (!editMode) {
+    bgSong.currentTime = 0;
+    bgSong.play().catch(()=>{});
+  }
+}
+
+function restart() {
+  player.x = startBlock.x;
+  player.y = startBlock.y - player.h;
+  player.dy = 0;
+  player.grounded = false;
+  player.wave = false;
+  player.waveDir = -1;
+  player.color = "cyan";
+  frame = 0;
+  cameraX = Math.max(0, player.x - canvas.width / 3);
+  bgColor = "#222";
+}
+
+/* Utils */
+function collidesRect(a, b) {
+  return a.x + a.w > b.x && a.x < b.x + b.size && a.y + a.h > b.y && a.y < b.y + b.size;
+}
+function collides(p) {
+  // Player vs square
+  return player.x + player.w > p.x && player.x < p.x + p.size && player.y + player.h > p.y && player.y < p.y + p.size;
+}
+function drawGrid() {
+  const left = Math.floor(cameraX / gridSize) * gridSize - cameraX;
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = left; x < canvas.width; x += gridSize) {
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+  }
+  for (let y = 0; y < canvas.height; y += gridSize) {
+    ctx.moveTo(0, y);
+    ctx.lineTo(canvas.width, y);
+  }
+  ctx.stroke();
+}
+
+/* Update and render */
+function update() {
+  // Background
+  ctx.fillStyle = bgColor;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Editor grid
+  if (editMode) drawGrid();
+
+  // Ground
+  ctx.fillStyle = "#444";
+  ctx.fillRect(-cameraX, groundY, 20000, gridSize);
+
+  // Objects
+  ctx.fillStyle = "#888";
+  platforms.forEach(p => ctx.fillRect(p.x - cameraX, p.y, p.size, p.size));
+
+  // Spikes (triangles)
+  ctx.fillStyle = "red";
+  spikes.forEach(s => {
+    ctx.beginPath();
+    ctx.moveTo(s.x - cameraX, s.y + s.size);
+    ctx.lineTo(s.x + s.size / 2 - cameraX, s.y);
+    ctx.lineTo(s.x + s.size - cameraX, s.y + s.size);
+    ctx.closePath();
+    ctx.fill();
+  });
+
+  // Jump pads
+  ctx.fillStyle = "orange";
+  jumpPads.forEach(j => ctx.fillRect(j.x - cameraX, j.y, j.size, j.size));
+
+  // Speed portals
+  speedPortals.forEach(s => {
+    ctx.fillStyle = s.speed > 1 ? "limegreen" : "dodgerblue";
+    ctx.fillRect(s.x - cameraX, s.y, s.size, s.size);
+  });
+
+  // Portals
+  ctx.fillStyle = "goldenrod";
+  wavePortals.forEach(w => ctx.fillRect(w.x - cameraX, w.y, w.size, w.size));
+  ctx.fillStyle = "deeppink";
+  cubePortals.forEach(c => ctx.fillRect(c.x - cameraX, c.y, c.size, c.size));
+
+  // Triggers
+  colorTriggers.forEach(c => { ctx.fillStyle = c.color; ctx.fillRect(c.x - cameraX, c.y, c.size, c.size); });
+  bgTriggers.forEach(c => { ctx.fillStyle = c.color; ctx.fillRect(c.x - cameraX, c.y, c.size, c.size); });
+
+  // Start/End
+  ctx.fillStyle = "lime";
+  ctx.fillRect(startBlock.x - cameraX, startBlock.y, startBlock.size, startBlock.size);
+  ctx.fillStyle = "gold";
+  ctx.fillRect(endBlock.x - cameraX, endBlock.y, endBlock.size, endBlock.size);
+
+  // GAME LOGIC
+  if (!editMode) {
+    // Move forward
+    player.x += player.dashSpeed;
+
+    // Mode handling
+    if (!player.wave) {
+      // Cube physics
+      player.dy += player.gravity;
+      player.y += player.dy;
+      player.grounded = false;
+    } else {
+      // Wave physics: hold to go up, release to go down
+      const holding = mouseDown || keys["Space"] || keys["Mouse0"];
+      player.waveDir = holding ? -1 : 1;
+      player.y += player.waveDir * player.waveSpeed;
+      // Slight smoothing with gravity
+      if (player.waveDir > 0) player.y += 0.5;
+    }
+
+    // Ground collision (only for cube; wave grazes ground = death)
+    if (!player.wave) {
+      if (player.y + player.h > groundY) {
+        player.y = groundY - player.h;
+        player.dy = 0;
+        player.grounded = true;
+      }
+    } else {
+      if (player.y + player.h >= groundY) dieAndRestart();
+    }
+
+    // Platform collision (land only from above in cube)
+    if (!player.wave) {
+      platforms.forEach(p => {
+        const falling = player.dy >= 0;
+        const overlapX = player.x + player.w > p.x && player.x < p.x + p.size;
+        const hittingTop = player.y + player.h > p.y && player.y + player.h < p.y + p.size;
+        if (falling && overlapX && hittingTop) {
+          player.y = p.y - player.h;
+          player.dy = 0;
+          player.grounded = true;
+        }
+      });
+    } else {
+      // Wave hits platform = death (keeps it simple)
+      platforms.forEach(p => { if (collidesRect({x:player.x,y:player.y,w:player.w,h:player.h}, p)) dieAndRestart(); });
+    }
+
+    // Jump pads
+    jumpPads.forEach(j => {
+      if (collides(j)) {
+        player.dy = -12;
+        player.grounded = false;
+      }
+    });
+
+    // Speed portals
+    speedPortals.forEach(s => { if (collides(s)) player.dashSpeed = 6 * s.speed; });
+
+    // Portals
+    wavePortals.forEach(w => {
+      if (collides(w)) {
+        player.wave = true;
+        player.grounded = false;
+        player.dy = 0;
+        player.waveDir = -1;
+      }
+    });
+    cubePortals.forEach(c => {
+      if (collides(c)) {
+        player.wave = false;
+        player.dy = 0;
+        player.grounded = false;
+      }
+    });
+
+    // Triggers
+    colorTriggers.forEach(c => { if (collides(c)) player.color = c.color; });
+    bgTriggers.forEach(c => { if (collides(c)) bgColor = c.color; });
+
+    // Spikes: treat as lethal if within bounding box
+    spikes.forEach(s => {
+      const box = { x: s.x, y: s.y, size: s.size };
+      if (collides(box)) dieAndRestart();
+    });
+
+    // End block
+if (collides(endBlock)) {
+  alert("You win!");
+  restart();
+    }
+
+    // Off-screen top/bottom = death
+    if (player.y < -200 || player.y > canvas.height + 200) dieAndRestart();
+
+    // Camera follow
+    const targetCam = Math.max(0, player.x - canvas.width / 3);
+    cameraX += (targetCam - cameraX) * 0.15;
+  }
+
+  // Draw player
+  ctx.fillStyle = player.color;
+  if (!player.wave) {
+    // Cube
+    ctx.fillRect(player.x - cameraX, player.y, player.w, player.h);
+  } else {
+    // Wave: draw a diamond
+    const cx = player.x + player.w/2 - cameraX;
+    const cy = player.y + player.h/2;
+    const r = player.w/2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r, cy);
+    ctx.lineTo(cx, cy + r);
+    ctx.lineTo(cx - r, cy);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+/* Death */
+function dieAndRestart() {
+  restart();
+}
+
+/* Main loop */
+function loop() {
+  update();
+  frame++;
+  requestAnimationFrame(loop);
+}
+restart(); // initialize
+loop();    // start loop
+
+// Start with editor mode muted; play only when switching to play mode
+if (!editMode) tryPlaySong();
+</script>
+</body>
+</html>
